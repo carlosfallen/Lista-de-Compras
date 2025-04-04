@@ -1,3 +1,4 @@
+// firebase deploy --only hosting:shoppingoflist
 import { useState, useEffect } from 'react';
 import { Plus, Edit, Trash2, X, Check } from 'lucide-react';
 import { collection, addDoc, updateDoc, deleteDoc, doc, getDocs } from 'firebase/firestore';
@@ -14,6 +15,12 @@ interface ShoppingItem {
   completed: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+interface NewItemState {
+  name: string;
+  quantity: number;
+  unitPrice: string;
 }
 
 // Online/offline detection
@@ -40,91 +47,111 @@ function App() {
   const [items, setItems] = useState<ShoppingItem[]>([]);
   const [isAddingItem, setIsAddingItem] = useState(false);
   const [isEditingItem, setIsEditingItem] = useState<string | null>(null);
-  const [newItem, setNewItem] = useState({
+  const [newItem, setNewItem] = useState<NewItemState>({
     name: '',
     quantity: 1,
-    unitPrice: 0,
+    unitPrice: '',
   });
   const [pendingChanges, setPendingChanges] = useState<ShoppingItem[]>([]);
   const isOnline = useOnlineStatus();
 
-  // Load data on component mount
   useEffect(() => {
     loadItems();
   }, []);
 
-  // Sync pending changes when coming back online
   useEffect(() => {
     if (isOnline && pendingChanges.length > 0) {
       syncPendingChanges();
     }
-  }, [isOnline, pendingChanges]);
+  }, [isOnline]);
 
- // No useEffect de carregamento inicial, garantir a ordem correta
-const loadItems = async () => {
-  try {
-    // Primeiro tenta carregar do localStorage
-    const localItems = localStorage.getItem('shopping-items');
-    const localData = localItems ? JSON.parse(localItems) : [];
+  const loadItems = async () => {
+    try {
+      const localItems = localStorage.getItem('shopping-items');
+      const localData = localItems ? JSON.parse(localItems) : [];
 
-    // Se online, busca do Firebase
-    if (navigator.onLine) {
-      const querySnapshot = await getDocs(collection(db, 'items'));
-      const fetchedItems = querySnapshot.docs.map(doc => ({
-        ...doc.data(),
-        id: doc.id,
-      })) as ShoppingItem[];
-      
-      // Atualiza localStorage apenas se houver dados do Firebase
-      if (fetchedItems.length > 0) {
-        localStorage.setItem('shopping-items', JSON.stringify(fetchedItems));
-        setItems(fetchedItems);
+      if (navigator.onLine) {
+        try {
+          const querySnapshot = await getDocs(collection(db, 'items'));
+          const fetchedItems = querySnapshot.docs.map(doc => ({
+            ...doc.data(),
+            id: doc.id,
+          })) as ShoppingItem[];
+          
+          // Update localStorage and state only if we got data from Firebase
+          if (fetchedItems.length > 0) {
+            setItems(fetchedItems);
+            localStorage.setItem('shopping-items', JSON.stringify(fetchedItems));
+          } else if (localData.length > 0) {
+            // Only use local data if Firebase returned empty results
+            setItems(localData);
+          }
+        } catch (error) {
+          console.error('Error loading from Firebase:', error);
+          // Fallback to local data on Firebase error
+          if (localData.length > 0) {
+            setItems(localData);
+          }
+        }
       } else if (localData.length > 0) {
+        // Offline mode - use local data
         setItems(localData);
       }
-    } else if (localData.length > 0) {
-      setItems(localData);
-    }
-  } catch (error) {
-    console.error('Error loading items:', error);
-  }
-};
-
-  const syncPendingChanges = async () => {
-    try {
-      for (const item of pendingChanges) {
-        if (!item.id.includes('local-')) {
-          // Update existing item - Fix: Convert ShoppingItem to plain object
-          const { id, ...itemWithoutId } = item;
-          await updateDoc(doc(db, 'items', item.id), itemWithoutId);
-        } else {
-          // Add new item with Firebase-generated ID
-          const { id, ...itemData } = item;
-          const docRef = await addDoc(collection(db, 'items'), itemData);
-          // Update local ID with Firebase ID
-          updateLocalItemId(id, docRef.id);
-        }
-      }
-      
-      // Clear pending changes after successful sync
-      setPendingChanges([]);
-      
-      // Reload items from Firebase
-      loadItems();
     } catch (error) {
-      console.error('Error syncing changes:', error);
+      console.error('Error loading items:', error);
+      // Final fallback
+      const localItems = localStorage.getItem('shopping-items');
+      if (localItems) {
+        setItems(JSON.parse(localItems));
+      }
     }
   };
 
-  const updateLocalItemId = (localId: string, firebaseId: string) => {
-    setItems(currentItems => 
-      currentItems.map(item => 
-        item.id === localId ? { ...item, id: firebaseId } : item
-      )
-    );
-    localStorage.setItem('shopping-items', JSON.stringify(
-      items.map(item => item.id === localId ? { ...item, id: firebaseId } : item)
-    ));
+  const syncPendingChanges = async () => {
+    if (pendingChanges.length === 0) return;
+    
+    const updatedPendingChanges = [...pendingChanges];
+    const failedChanges: ShoppingItem[] = [];
+    
+    try {
+      for (let i = 0; i < updatedPendingChanges.length; i++) {
+        const item = updatedPendingChanges[i];
+        
+        try {
+          if (!item.id.includes('local-')) {
+            // Update existing document
+            const { id, ...itemWithoutId } = item;
+            await updateDoc(doc(db, 'items', id), itemWithoutId);
+          } else {
+            // Add new document
+            const { id, ...itemData } = item;
+            const docRef = await addDoc(collection(db, 'items'), itemData);
+            
+            // Update local items with the new Firebase ID
+            setItems(prevItems => 
+              prevItems.map(prevItem => 
+                prevItem.id === item.id ? { ...prevItem, id: docRef.id } : prevItem
+              )
+            );
+            
+            // Update localStorage with the new ID
+            const currentItems = JSON.parse(localStorage.getItem('shopping-items') || '[]');
+            const updatedItems = currentItems.map((localItem: ShoppingItem) => 
+              localItem.id === item.id ? { ...localItem, id: docRef.id } : localItem
+            );
+            localStorage.setItem('shopping-items', JSON.stringify(updatedItems));
+          }
+        } catch (error) {
+          console.error('Error syncing item:', error);
+          failedChanges.push(item);
+        }
+      }
+      
+      setPendingChanges(failedChanges);
+      
+    } catch (error) {
+      console.error('Error in sync process:', error);
+    }
   };
 
   const saveToStorage = (updatedItems: ShoppingItem[]) => {
@@ -132,67 +159,142 @@ const loadItems = async () => {
     localStorage.setItem('shopping-items', JSON.stringify(updatedItems));
   };
 
+  const parseCurrency = (value: string): number => {
+    // Handle empty string
+    if (!value) return 0;
+    
+    // Replace comma with dot for proper float parsing
+    const cleanValue = value.replace(/[^0-9,]/g, '').replace(/,/g, '.');
+    return parseFloat(cleanValue) || 0;
+  };
+
+  const formatCurrency = (value: number): string => {
+    return value.toFixed(2).replace('.', ',');
+  };
+
   const handleAddItem = async () => {
-    if (!newItem.name) return;
-
-    const item: ShoppingItem = {
-      id: isOnline ? crypto.randomUUID() : `local-${Date.now()}`,
-      name: newItem.name,
-      quantity: newItem.quantity,
-      unitPrice: newItem.unitPrice,
-      total: newItem.quantity * newItem.unitPrice,
-      completed: false,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    const updatedItems = [...items, item];
-    saveToStorage(updatedItems);
-
-    if (isOnline) {
-      try {
-        const { id, ...itemData } = item;
-        const docRef = await addDoc(collection(db, 'items'), itemData);
-        updateLocalItemId(item.id, docRef.id);
-      } catch (error) {
-        console.error('Error adding item to Firebase:', error);
-        setPendingChanges([...pendingChanges, item]);
+    if (!newItem.name || newItem.quantity <= 0) return;
+  
+    const parsedPrice = parseCurrency(newItem.unitPrice);
+    let newItemData: ShoppingItem;
+    let updatedItems: ShoppingItem[];
+  
+    try {
+      if (isOnline) {
+        // Tenta salvar diretamente no Firebase primeiro
+        const docRef = await addDoc(collection(db, 'items'), {
+          name: newItem.name,
+          quantity: newItem.quantity,
+          unitPrice: parsedPrice,
+          total: newItem.quantity * parsedPrice,
+          completed: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+  
+        // Cria o item com ID do Firebase
+        newItemData = {
+          id: docRef.id,
+          name: newItem.name,
+          quantity: newItem.quantity,
+          unitPrice: parsedPrice,
+          total: newItem.quantity * parsedPrice,
+          completed: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+  
+        // Atualiza o estado local com o ID real do Firebase
+        updatedItems = [...items, newItemData];
+        saveToStorage(updatedItems);
+  
+      } else {
+        // Offline: usa ID local temporário
+        const newItemId = `local-${Date.now()}`;
+        newItemData = {
+          id: newItemId,
+          name: newItem.name,
+          quantity: newItem.quantity,
+          unitPrice: parsedPrice,
+          total: newItem.quantity * parsedPrice,
+          completed: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+  
+        updatedItems = [...items, newItemData];
+        saveToStorage(updatedItems);
+        setPendingChanges(prev => [...prev, newItemData]);
       }
-    } else {
-      setPendingChanges([...pendingChanges, item]);
+  
+    } catch (error) {
+      // Fallback para local se falhar o Firebase
+      const newItemId = `local-${Date.now()}`;
+      newItemData = {
+        id: newItemId,
+        name: newItem.name,
+        quantity: newItem.quantity,
+        unitPrice: parsedPrice,
+        total: newItem.quantity * parsedPrice,
+        completed: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+  
+      updatedItems = [...items, newItemData];
+      saveToStorage(updatedItems);
+      setPendingChanges(prev => [...prev, newItemData]);
     }
-
-    setNewItem({ name: '', quantity: 1, unitPrice: 0 });
+  
+    // Reset do formulário
+    setNewItem({ name: '', quantity: 1, unitPrice: '' });
     setIsAddingItem(false);
   };
 
-  const handleUpdateItem = async (updatedItem: ShoppingItem) => {
-    const updatedItems = items.map(item => 
-      item.id === updatedItem.id ? updatedItem : item
-    );
+  const handleUpdateItem = async (itemId: string) => {
+    const parsedPrice = parseCurrency(newItem.unitPrice);
+    const itemToUpdate = items.find(item => item.id === itemId);
     
+    if (!itemToUpdate) return;
+
+    const newData = {
+      ...itemToUpdate,
+      name: newItem.name,
+      quantity: newItem.quantity,
+      unitPrice: parsedPrice,
+      total: newItem.quantity * parsedPrice,
+      updatedAt: new Date().toISOString()
+    };
+
+    // Update local state first
+    const updatedItems = items.map(item => item.id === itemId ? newData : item);
     saveToStorage(updatedItems);
 
-    if (isOnline) {
+    // Reset editing state
+    setIsEditingItem(null);
+    setNewItem({ name: '', quantity: 1, unitPrice: '' });
+
+    // Try to sync with Firebase if online
+    if (isOnline && !itemId.includes('local-')) {
       try {
-        // Fix: Extract id and pass the rest as a plain object
-        const { id, ...itemWithoutId } = updatedItem;
+        const { id, ...itemWithoutId } = newData;
         await updateDoc(doc(db, 'items', id), itemWithoutId);
       } catch (error) {
         console.error('Error updating item in Firebase:', error);
-        setPendingChanges([...pendingChanges, updatedItem]);
+        setPendingChanges(prev => [...prev, newData]);
       }
     } else {
-      setPendingChanges([...pendingChanges, updatedItem]);
+      // Add to pending changes for later sync
+      setPendingChanges(prev => [...prev, newData]);
     }
-
-    setIsEditingItem(null);
   };
 
   const handleRemoveItem = async (id: string) => {
+    // Update local state first
     const updatedItems = items.filter(item => item.id !== id);
     saveToStorage(updatedItems);
 
+    // Try to delete from Firebase if online
     if (isOnline && !id.includes('local-')) {
       try {
         await deleteDoc(doc(db, 'items', id));
@@ -201,26 +303,44 @@ const loadItems = async () => {
       }
     }
     
-    // Also remove from pending changes if present
-    setPendingChanges(pendingChanges.filter(item => item.id !== id));
+    // Remove from pending changes if present
+    setPendingChanges(prev => prev.filter(item => item.id !== id));
   };
 
-  const toggleItemCompletion = (id: string) => {
+  const toggleItemCompletion = async (id: string) => {
     const itemToUpdate = items.find(item => item.id === id);
     if (!itemToUpdate) return;
-
+    
     const updatedItem = {
       ...itemToUpdate,
       completed: !itemToUpdate.completed,
       updatedAt: new Date().toISOString()
     };
+    
+    // Update local state first
+    const updatedItems = items.map(item => 
+      item.id === id ? updatedItem : item
+    );
+    saveToStorage(updatedItems);
+    
+    // Try to sync with Firebase if online
+    if (isOnline && !id.includes('local-')) {
+      try {
+        const { id: docId, ...itemData } = updatedItem;
+        await updateDoc(doc(db, 'items', docId), itemData);
+      } catch (error) {
+        console.error('Error updating item completion in Firebase:', error);
+        setPendingChanges(prev => [...prev, updatedItem]);
+      }
+    } else {
+      // Add to pending changes for later sync
+      setPendingChanges(prev => [...prev, updatedItem]);
+    }
+  };
 
-    handleUpdateItem(updatedItem);
-  };
-  
-  const calculateTotal = () => {
-    return items.reduce((sum, item) => sum + item.total, 0);
-  };
+  const calculateTotal = () => items
+    .filter(item => !item.completed)
+    .reduce((sum, item) => sum + item.total, 0);
 
   // Animation variants
   const listItemVariants = {
@@ -242,14 +362,14 @@ const loadItems = async () => {
       transition: { type: "tween", duration: 0.2 }
     },
     completed: { 
-      backgroundColor: "#F0FDF4",
-      opacity: 1, // Adicionado
-      y: 0, // Adicionado
+      backgroundColor: "#FDF0F4",
+      opacity: 1,
+      y: 0,
     },
     uncompleted: { 
       backgroundColor: "#FFFFFF",
-      opacity: 1, // Adicionado
-      y: 0, // Adicionado
+      opacity: 1,
+      y: 0,
     }
   };
 
@@ -300,7 +420,12 @@ const loadItems = async () => {
     update: (value: number) => ({
       scale: [1, 1.2, 1],
       color: ["#111827", "#3B82F6", "#111827"],
-      transition: { duration: 0.5 }
+      transition: { 
+        duration: 0.5,
+        ease: [0.4, 0, 0.2, 1],
+        stiffness: 100,
+        damping: 10
+      }
     })
   };
 
@@ -363,7 +488,7 @@ const loadItems = async () => {
               variants={headerTotalVariants}
               initial="update"
               animate="update"
-              key={calculateTotal()} // Add key to trigger animation on value change
+              key={calculateTotal()} 
               custom={calculateTotal()}
             >
               Total: R$ {calculateTotal().toFixed(2)}
@@ -371,7 +496,7 @@ const loadItems = async () => {
           </div>
           <div className="mt-1 flex items-center">
             <motion.div 
-              className={`w-3 h-3 rounded-full mr-2`}
+              className="w-3 h-3 rounded-full mr-2"
               variants={onlineStatusVariants}
               initial={isOnline ? "online" : "offline"}
               animate={isOnline ? "online" : "offline"}
@@ -398,7 +523,7 @@ const loadItems = async () => {
         <main>
           {/* Lista de Itens */}
           <div className="mb-24">
-            <AnimatePresence mode="wait">
+            <AnimatePresence>
               {items.length > 0 ? (
                 <motion.div 
                   className="bg-white rounded-2xl shadow-md overflow-hidden"
@@ -408,7 +533,6 @@ const loadItems = async () => {
                   key="items-list"
                 >
                   <div className="divide-y divide-gray-100">
-                    <AnimatePresence>
                       {items.map((item, index) => (
                         isEditingItem === item.id ? (
                           <motion.div 
@@ -465,15 +589,29 @@ const loadItems = async () => {
                                     inputMode="decimal"
                                     placeholder="Preço"
                                     className="w-full p-3 rounded-lg border border-gray-200 pr-10"
-                                    value={newItem.unitPrice || ""}
+                                    value={newItem.unitPrice}
                                     onChange={(e) => {
-                                      const value = e.target.value
-                                        .replace(/[^0-9,]/g, "")
-                                        .replace(/,/g, ".");
+                                      let value = e.target.value
+                                        .replace(/[^0-9,]/g, '')
+                                        .replace(/(,.*?),/g, '$1');
+
+                                      if (value.startsWith(',')) {
+                                        value = '0' + value;
+                                      }
+
                                       setNewItem({ 
                                         ...newItem, 
-                                        unitPrice: value ? parseFloat(value) : 0
+                                        unitPrice: value
                                       });
+                                    }}
+                                    onBlur={() => {
+                                      const parsedValue = parseCurrency(newItem.unitPrice);
+                                      const formattedValue = formatCurrency(parsedValue);
+
+                                      setNewItem(prev => ({
+                                        ...prev,
+                                        unitPrice: formattedValue
+                                      }));
                                     }}
                                   />
                                   <span className="absolute right-3 top-3 text-gray-400">R$</span>
@@ -484,17 +622,7 @@ const loadItems = async () => {
                                 <motion.button
                                   whileHover={{ scale: 1.03 }}
                                   whileTap={{ scale: 0.97 }}
-                                  onClick={() => {
-                                    const updatedItem = {
-                                      ...item,
-                                      name: newItem.name,
-                                      quantity: newItem.quantity,
-                                      unitPrice: newItem.unitPrice,
-                                      total: newItem.quantity * newItem.unitPrice,
-                                      updatedAt: new Date().toISOString()
-                                    };
-                                    handleUpdateItem(updatedItem);
-                                  }}
+                                  onClick={() => handleUpdateItem(item.id)}
                                   className="flex-1 p-3 bg-blue-500 text-white rounded-lg flex items-center justify-center gap-1"
                                 >
                                   <Check size={18} />
@@ -505,7 +633,7 @@ const loadItems = async () => {
                                   whileTap={{ scale: 0.97 }}
                                   onClick={() => {
                                     setIsEditingItem(null);
-                                    setNewItem({ name: '', quantity: 1, unitPrice: 0 });
+                                    setNewItem({ name: '', quantity: 1, unitPrice: '' });
                                   }}
                                   className="p-3 bg-gray-200 text-gray-700 rounded-lg"
                                 >
@@ -540,7 +668,7 @@ const loadItems = async () => {
                                       variants={checkboxVariants}
                                       initial={item.completed ? "checked" : "unchecked"}
                                       animate={item.completed ? "checked" : "unchecked"}
-                                      className={`w-6 h-6 rounded-md flex items-center justify-center border-2`}
+                                      className="w-6 h-6 rounded-md flex items-center justify-center border-2"
                                     >
                                       {item.completed && (
                                         <motion.div
@@ -563,7 +691,12 @@ const loadItems = async () => {
                                   </motion.h4>
                                   <div className="flex gap-4 mt-1 text-sm text-gray-500">
                                     <span>{item.quantity} un</span>
-                                    <span>R$ {item.unitPrice.toFixed(2)}</span>
+                                    <span>
+                                      {item.unitPrice.toLocaleString('pt-BR', {
+                                        style: 'currency',
+                                        currency: 'BRL'
+                                      })}
+                                    </span>
                                   </div>
                                 </div>
                               </div>
@@ -587,7 +720,7 @@ const loadItems = async () => {
                                       setNewItem({
                                         name: item.name,
                                         quantity: item.quantity,
-                                        unitPrice: item.unitPrice
+                                        unitPrice: formatCurrency(item.unitPrice)
                                       });
                                     }}
                                     className="p-2 text-blue-500 active:scale-95"
@@ -608,7 +741,6 @@ const loadItems = async () => {
                           </motion.div>
                         )
                       ))}
-                    </AnimatePresence>
                   </div>
                 </motion.div>
               ) : (
@@ -739,23 +871,39 @@ const loadItems = async () => {
                     animate={{ y: 0, opacity: 1 }}
                     transition={{ delay: 0.4 }}
                   >
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      placeholder="Preço"
-                      className="w-full p-4 rounded-xl border border-gray-200 pr-10
-                             focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      value={newItem.unitPrice || ""}
-                      onChange={(e) => {
-                        const value = e.target.value
-                          .replace(/[^0-9,]/g, "")
-                          .replace(/,/g, ".");
-                        setNewItem({ 
-                          ...newItem, 
-                          unitPrice: value ? parseFloat(value) : 0
-                        });
-                      }}
-                    />
+<input
+  type="text"
+  inputMode="decimal"
+  placeholder="Preço"
+  className="w-full p-3 rounded-lg border border-gray-200 pr-10"
+  value={newItem.unitPrice}
+  onChange={(e) => {
+    let value = e.target.value
+      .replace(/[^0-9,]/g, '') // Permite apenas números e vírgulas
+      .replace(/(,.*?),/g, '$1'); // Remove múltiplas vírgulas
+
+    // Permite vírgula inicial convertendo para "0,"
+    if (value.startsWith(',')) {
+      value = '0' + value;
+    }
+
+    setNewItem({ 
+      ...newItem, 
+      unitPrice: value
+    });
+  }}
+  onBlur={() => {
+    const parsedValue = parseCurrency(newItem.unitPrice);
+    const formattedValue = parsedValue
+      .toFixed(2)
+      .replace('.', ',');
+
+    setNewItem(prev => ({
+      ...prev,
+      unitPrice: formattedValue
+    }));
+  }}
+/>
                     <span className="absolute right-4 top-4 text-gray-400">R$</span>
                   </motion.div>
                 </div>
